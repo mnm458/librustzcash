@@ -10,8 +10,18 @@ workspace.
 
 ## [Unreleased]
 
+### Added
+- `pczt::roles::signer::UserAddressError`
+- `pczt::roles::signer::Error::UserAddress`
+
 ### Changed
 - MSRV is now 1.89
+- `pczt::roles::signer::Signer::new` now verifies every output's `user_address`
+  against that output's committed recipient, rejecting the PCZT with
+  `Error::UserAddress` if the address does not parse, does not contain the
+  recipient, or cannot be checked because the recipient is absent. Previously
+  the field was not checked, so a counterparty could pair an output paying an
+  address they control with a display string the signing user trusts.
 
 ## [0.10.0-pre.2] - 2026-10-13
 

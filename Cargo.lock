@@ -3452,6 +3452,7 @@ dependencies = [
  "sha2 0.10.8",
  "shardtree",
  "subtle",
+ "zcash_address",
  "zcash_note_encryption",
  "zcash_primitives",
  "zcash_proofs",

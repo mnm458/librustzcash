@@ -15,6 +15,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
+zcash_address = { workspace = true, optional = true }
 zcash_note_encryption = { workspace = true, optional = true }
 zcash_primitives = { workspace = true, optional = true }
 zcash_protocol = { workspace = true, default-features = false }
@@ -139,6 +140,7 @@ prover = [
 signer = [
     "dep:blake2b_simd",
     "dep:rand_core",
+    "dep:zcash_address",
     "dep:zcash_primitives",
     "orchard",
     "sapling",

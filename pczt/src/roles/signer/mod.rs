@@ -32,6 +32,15 @@
 //! ciphertext. The note and its commitment are unaffected, so `cmx` is derived and
 //! checked as for any other output.
 //!
+//! # `user_address` verification
+//!
+//! An output's `user_address` is an uncommitted display string whose contract is that it
+//! contains the output's committed recipient. The sighash commits only to on-wire
+//! effects, so a malicious counterparty could otherwise pair an output paying an address
+//! they control with a display string the signing user trusts. [`Signer::new`] therefore
+//! rejects a PCZT containing any output whose `user_address` is present but does not
+//! verifiably contain that output's recipient; see [`UserAddressError`].
+//!
 //! # Signing before the anchor and witnesses are known
 //!
 //! For v6 and later transaction formats, a Signer MAY sign a spend whose `witness` is
@@ -56,15 +65,25 @@
 //! [`Updater`]: crate::roles::updater::Updater
 
 use alloc::vec::Vec;
+use core::convert::Infallible;
 
 use blake2b_simd::Hash as Blake2bHash;
 use orchard::primitives::redpallas;
 use rand_core::{CryptoRng, Rng};
 
-use ::transparent::sighash::{SIGHASH_ANYONECANPAY, SIGHASH_NONE, SIGHASH_SINGLE, SighashPolicy};
+use ::transparent::{
+    address::TransparentAddress,
+    sighash::{SIGHASH_ANYONECANPAY, SIGHASH_NONE, SIGHASH_SINGLE, SighashPolicy},
+};
+use zcash_address::{
+    ConversionError, TryFromAddress, ZcashAddress,
+    unified::{self, Container, Receiver},
+};
 use zcash_primitives::transaction::{
     TransactionData, TxDigests, sighash::SignableInput, txid::TxIdDigester,
 };
+use zcash_protocol::{PoolType, ShieldedPool, consensus::NetworkType};
+use zcash_script::script::Evaluable;
 
 use crate::{
     ExtractError, ParsedPczt, Pczt,
@@ -173,7 +192,13 @@ pub struct Signer {
 
 impl Signer {
     /// Instantiates the Signer role with the given PCZT.
+    ///
+    /// Returns an error if the PCZT's effects cannot be extracted, or if any output's
+    /// `user_address` does not verifiably contain that output's committed recipient
+    /// (see [`UserAddressError`]).
     pub fn new(pczt: Pczt) -> Result<Self, Error> {
+        verify_user_addresses(&pczt)?;
+
         let anchor_requirement =
             crate::common::AnchorRequirement::for_pre_authorization(pczt.global.tx_version);
         let empty_ironwood = pczt
@@ -619,6 +644,186 @@ impl Signer {
     }
 }
 
+/// The receivers of a parsed `user_address`, in the forms needed for comparison against
+/// an output's committed recipient.
+///
+/// A Unified Address contains at most one receiver per typecode, so a single slot per
+/// value pool suffices. The Ironwood pool shares the Orchard receiver encoding.
+#[derive(Default)]
+struct UserAddressReceivers {
+    orchard: Option<[u8; 43]>,
+    sapling: Option<[u8; 43]>,
+    transparent: Option<TransparentAddress>,
+}
+
+impl TryFromAddress for UserAddressReceivers {
+    type Error = Infallible;
+
+    // Sprout addresses use the default implementation: no PCZT output can commit to a
+    // Sprout recipient, so conversion failure correctly reports a mismatch.
+
+    fn try_from_sapling(
+        _net: NetworkType,
+        data: [u8; 43],
+    ) -> Result<Self, ConversionError<Self::Error>> {
+        Ok(Self {
+            sapling: Some(data),
+            ..Self::default()
+        })
+    }
+
+    fn try_from_unified(
+        _net: NetworkType,
+        data: unified::Address,
+    ) -> Result<Self, ConversionError<Self::Error>> {
+        let mut receivers = Self::default();
+        for item in data.items() {
+            match item {
+                Receiver::Orchard(data) => receivers.orchard = Some(data),
+                Receiver::Sapling(data) => receivers.sapling = Some(data),
+                Receiver::P2pkh(data) => {
+                    receivers.transparent = Some(TransparentAddress::PublicKeyHash(data));
+                }
+                Receiver::P2sh(data) => {
+                    receivers.transparent = Some(TransparentAddress::ScriptHash(data));
+                }
+                Receiver::Unknown { .. } => (),
+            }
+        }
+        Ok(receivers)
+    }
+
+    fn try_from_transparent_p2pkh(
+        _net: NetworkType,
+        data: [u8; 20],
+    ) -> Result<Self, ConversionError<Self::Error>> {
+        Ok(Self {
+            transparent: Some(TransparentAddress::PublicKeyHash(data)),
+            ..Self::default()
+        })
+    }
+
+    fn try_from_transparent_p2sh(
+        _net: NetworkType,
+        data: [u8; 20],
+    ) -> Result<Self, ConversionError<Self::Error>> {
+        Ok(Self {
+            transparent: Some(TransparentAddress::ScriptHash(data)),
+            ..Self::default()
+        })
+    }
+
+    fn try_from_tex(
+        _net: NetworkType,
+        data: [u8; 20],
+    ) -> Result<Self, ConversionError<Self::Error>> {
+        Ok(Self {
+            transparent: Some(TransparentAddress::PublicKeyHash(data)),
+            ..Self::default()
+        })
+    }
+}
+
+/// Parses a `user_address` into its comparable receivers.
+///
+/// The network encoded in the address is not checked: a PCZT does not commit to a
+/// network, so only receiver data can be compared.
+fn parse_user_address(addr: &str) -> Result<UserAddressReceivers, UserAddressError> {
+    let addr = ZcashAddress::try_from_encoded(addr).map_err(UserAddressError::Parse)?;
+    // The only possible conversion failure is an address kind that cannot contain any
+    // recipient representable in a PCZT output, which is a mismatch by definition.
+    addr.convert()
+        .map_err(|_| UserAddressError::MismatchedRecipient)
+}
+
+/// Verifies a shielded output's `user_address` against its committed recipient.
+///
+/// `receiver` selects, from the parsed address, the receiver encoding for the output's
+/// value pool.
+fn check_shielded_user_address(
+    user_address: Option<&str>,
+    recipient: Option<&[u8; 43]>,
+    receiver: fn(&UserAddressReceivers) -> Option<[u8; 43]>,
+) -> Result<(), UserAddressError> {
+    match user_address {
+        None => Ok(()),
+        Some(addr) => {
+            // A display claim that cannot be checked against the committed recipient
+            // must not reach a signature.
+            let recipient = recipient.ok_or(UserAddressError::MissingRecipient)?;
+            if receiver(&parse_user_address(addr)?) == Some(*recipient) {
+                Ok(())
+            } else {
+                Err(UserAddressError::MismatchedRecipient)
+            }
+        }
+    }
+}
+
+/// Verifies a transparent output's `user_address` against its `script_pubkey`.
+///
+/// The output pays the claimed address only if `script_pubkey` is exactly the canonical
+/// P2PKH or P2SH script for a transparent receiver of the parsed address; any other
+/// script (including a non-standard one) is a mismatch.
+fn check_transparent_user_address(
+    user_address: Option<&str>,
+    script_pubkey: &[u8],
+) -> Result<(), UserAddressError> {
+    match user_address {
+        None => Ok(()),
+        Some(addr) => match parse_user_address(addr)?.transparent {
+            Some(receiver) if receiver.script().to_bytes() == script_pubkey => Ok(()),
+            _ => Err(UserAddressError::MismatchedRecipient),
+        },
+    }
+}
+
+/// Verifies every output's `user_address` against that output's committed recipient,
+/// rejecting the PCZT if any claim fails to verify.
+fn verify_user_addresses(pczt: &Pczt) -> Result<(), Error> {
+    for (index, output) in pczt.transparent.outputs.iter().enumerate() {
+        check_transparent_user_address(output.user_address.as_deref(), &output.script_pubkey)
+            .map_err(|error| Error::UserAddress {
+                pool: PoolType::Transparent,
+                index,
+                error,
+            })?;
+    }
+
+    for (index, output) in pczt.sapling.outputs.iter().enumerate() {
+        check_shielded_user_address(
+            output.user_address.as_deref(),
+            output.recipient.as_ref(),
+            |receivers| receivers.sapling,
+        )
+        .map_err(|error| Error::UserAddress {
+            pool: PoolType::Shielded(ShieldedPool::Sapling),
+            index,
+            error,
+        })?;
+    }
+
+    for (pool, bundle) in [
+        (ShieldedPool::Orchard, &pczt.orchard),
+        (ShieldedPool::Ironwood, &pczt.ironwood),
+    ] {
+        for (index, action) in bundle.actions.iter().enumerate() {
+            check_shielded_user_address(
+                action.output.user_address.as_deref(),
+                action.output.recipient.as_ref(),
+                |receivers| receivers.orchard,
+            )
+            .map_err(|error| Error::UserAddress {
+                pool: PoolType::Shielded(pool),
+                index,
+                error,
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Errors that can occur while creating signatures for a PCZT.
 #[derive(Debug)]
 pub enum Error {
@@ -631,6 +836,17 @@ pub enum Error {
     SaplingSign(sapling::pczt::SignerError),
     SaplingVerify(sapling::pczt::VerifyError),
     TransparentSign(transparent::pczt::SignerError),
+    /// An output's `user_address` failed verification against the output's committed
+    /// recipient.
+    UserAddress {
+        /// The value pool of the output whose `user_address` failed verification.
+        pool: PoolType,
+        /// The index of the output within its bundle (for Orchard-protocol pools, the
+        /// index of its action).
+        index: usize,
+        /// The reason verification failed.
+        error: UserAddressError,
+    },
 }
 
 impl From<crate::ExtractError> for Error {
@@ -639,14 +855,44 @@ impl From<crate::ExtractError> for Error {
     }
 }
 
+/// Errors in verifying an output's `user_address` against the output's committed
+/// recipient.
+///
+/// An output's `user_address` is an uncommitted display string whose contract is that it
+/// contains the output's committed recipient (directly, or as a receiver within a
+/// Unified Address). Each of these errors means that contract could not be confirmed, so
+/// the output must not be signed.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum UserAddressError {
+    /// The `user_address` is not a valid Zcash address encoding.
+    Parse(zcash_address::ParseError),
+    /// The output carries a `user_address`, but the committed recipient needed to verify
+    /// it is absent, so the claim cannot be checked.
+    MissingRecipient,
+    /// The parsed address does not contain the output's committed recipient.
+    MismatchedRecipient,
+}
+
 #[cfg(all(test, feature = "io-finalizer", feature = "orchard"))]
 mod tests {
+    use alloc::{collections::BTreeMap, string::String};
+
+    use ::transparent::address::TransparentAddress;
     use ff::{Field, PrimeField};
     use pasta_curves::pallas;
     use rand::{rand_core::UnwrapErr, rngs::SysRng};
-    use zcash_protocol::consensus::BranchId;
+    use zcash_address::{
+        ToAddress, ZcashAddress,
+        unified::{self, Encoding, Receiver, Uitem},
+    };
+    use zcash_protocol::{
+        PoolType, ShieldedPool,
+        consensus::{BranchId, NetworkType},
+    };
+    use zcash_script::script::Evaluable;
 
-    use super::Signer;
+    use super::{Error, Signer, UserAddressError, check_shielded_user_address};
     use crate::{
         orchard::{Action, Spend},
         roles::{creator::Creator, io_finalizer::IoFinalizer, updater::Updater},
@@ -794,5 +1040,254 @@ mod tests {
             crate::orchard::EncCiphertext::Encrypted(randomized_ciphertext)
         );
         assert_eq!(pczt.ironwood.actions[0].output.value, Some(0));
+    }
+
+    /// Returns the raw encoding of the Orchard payment address derived from the given
+    /// spending key bytes.
+    fn orchard_recipient(sk_bytes: [u8; 32]) -> [u8; 43] {
+        use orchard::keys::{FullViewingKey, Scope, SpendingKey};
+
+        FullViewingKey::from(&SpendingKey::from_bytes(sk_bytes).unwrap())
+            .address_at(0u32, Scope::External)
+            .to_raw_address_bytes()
+    }
+
+    /// Encodes a mainnet Unified Address containing exactly the given Orchard receiver.
+    fn unified_address_for_orchard(receiver: [u8; 43]) -> String {
+        unified::Address::try_from_items(
+            unified::Revision::R0,
+            alloc::vec![Uitem::Data(Receiver::Orchard(receiver))],
+        )
+        .expect("a single Orchard receiver is a valid UA")
+        .encode(&NetworkType::Main)
+    }
+
+    /// An output whose `user_address` names a different recipient than the one the
+    /// sighash commits to is the approval-time deception the Signer exists to prevent;
+    /// the Signer role must refuse to instantiate for such a PCZT.
+    #[test]
+    fn signer_rejects_user_address_omitting_committed_recipient() {
+        let committed = orchard_recipient([0; 32]);
+        let displayed = orchard_recipient([1; 32]);
+        assert_ne!(committed, displayed);
+
+        let mut action = dummy_action();
+        action.output.recipient = Some(committed);
+        action.output.user_address = Some(unified_address_for_orchard(displayed));
+
+        let mut pczt = Creator::new(BranchId::Nu6_3.into(), 100, 133, None, None)
+            .unwrap()
+            .build()
+            .unwrap();
+        pczt.ironwood.actions.push(action);
+
+        assert!(matches!(
+            Signer::new(pczt),
+            Err(Error::UserAddress {
+                pool: PoolType::Shielded(ShieldedPool::Ironwood),
+                index: 0,
+                error: UserAddressError::MismatchedRecipient,
+            })
+        ));
+    }
+
+    /// A `user_address` on an output whose `recipient` is absent is an unverifiable
+    /// display claim, and omitting `recipient` must not become a way to smuggle a
+    /// deceptive string past the mismatch check.
+    #[test]
+    fn signer_rejects_user_address_without_committed_recipient() {
+        let mut action = dummy_action();
+        action.output.recipient = None;
+        action.output.user_address = Some(unified_address_for_orchard(orchard_recipient([0; 32])));
+
+        let mut pczt = Creator::new(BranchId::Nu6_3.into(), 100, 133, None, None)
+            .unwrap()
+            .build()
+            .unwrap();
+        pczt.ironwood.actions.push(action);
+
+        assert!(matches!(
+            Signer::new(pczt),
+            Err(Error::UserAddress {
+                pool: PoolType::Shielded(ShieldedPool::Ironwood),
+                index: 0,
+                error: UserAddressError::MissingRecipient,
+            })
+        ));
+    }
+
+    /// A `user_address` that is not a Zcash address encoding cannot make any verifiable
+    /// claim at all.
+    #[test]
+    fn signer_rejects_unparseable_user_address() {
+        let mut action = dummy_action();
+        action.output.recipient = Some(orchard_recipient([0; 32]));
+        action.output.user_address = Some("not a zcash address".into());
+
+        let mut pczt = Creator::new(BranchId::Nu6_3.into(), 100, 133, None, None)
+            .unwrap()
+            .build()
+            .unwrap();
+        pczt.ironwood.actions.push(action);
+
+        assert!(matches!(
+            Signer::new(pczt),
+            Err(Error::UserAddress {
+                pool: PoolType::Shielded(ShieldedPool::Ironwood),
+                index: 0,
+                error: UserAddressError::Parse(_),
+            })
+        ));
+    }
+
+    /// A `user_address` containing the committed recipient satisfies the field's
+    /// contract, and signing proceeds.
+    #[test]
+    fn signer_accepts_user_address_containing_recipient() {
+        let recipient = orchard_recipient([0; 32]);
+
+        let mut action = dummy_action();
+        action.output.recipient = Some(recipient);
+        action.output.user_address = Some(unified_address_for_orchard(recipient));
+
+        let mut pczt = Creator::new(BranchId::Nu6_3.into(), 100, 133, None, None)
+            .unwrap()
+            .build()
+            .unwrap();
+        pczt.ironwood.actions.push(action);
+
+        let pczt = IoFinalizer::new(pczt)
+            .finalize_io(UnwrapErr(SysRng))
+            .unwrap();
+        let pczt = Signer::new(pczt).unwrap().finish();
+        assert_eq!(pczt.ironwood.actions[0].output.recipient, Some(recipient));
+    }
+
+    /// The check compares the committed recipient against the receiver for the output's
+    /// own value pool: a Unified Address that merely contains the committed bytes under
+    /// a different pool's typecode does not contain the recipient.
+    #[test]
+    fn shielded_user_address_check_selects_the_pools_receiver() {
+        let orchard_receiver = [1; 43];
+        let sapling_receiver = [2; 43];
+        let ua = unified::Address::try_from_items(
+            unified::Revision::R0,
+            alloc::vec![
+                Uitem::Data(Receiver::Orchard(orchard_receiver)),
+                Uitem::Data(Receiver::Sapling(sapling_receiver)),
+            ],
+        )
+        .unwrap()
+        .encode(&NetworkType::Main);
+
+        assert!(
+            check_shielded_user_address(Some(&ua), Some(&orchard_receiver), |r| r.orchard).is_ok()
+        );
+        assert!(
+            check_shielded_user_address(Some(&ua), Some(&sapling_receiver), |r| r.sapling).is_ok()
+        );
+        assert!(matches!(
+            check_shielded_user_address(Some(&ua), Some(&sapling_receiver), |r| r.orchard),
+            Err(UserAddressError::MismatchedRecipient)
+        ));
+        assert!(matches!(
+            check_shielded_user_address(Some(&ua), Some(&orchard_receiver), |r| r.sapling),
+            Err(UserAddressError::MismatchedRecipient)
+        ));
+    }
+
+    /// A transparent output pays the claimed address only if its `script_pubkey` is the
+    /// canonical script for one of that address's transparent receivers.
+    #[test]
+    fn signer_rejects_mismatched_transparent_user_address() {
+        let output = transparent_output(
+            TransparentAddress::PublicKeyHash([1; 20]),
+            ZcashAddress::from_transparent_p2pkh(NetworkType::Main, [2; 20]).encode(),
+        );
+
+        let mut pczt = Creator::new(BranchId::Nu6_3.into(), 100, 133, None, None)
+            .unwrap()
+            .build()
+            .unwrap();
+        pczt.transparent.outputs.push(output);
+
+        assert!(matches!(
+            Signer::new(pczt),
+            Err(Error::UserAddress {
+                pool: PoolType::Transparent,
+                index: 0,
+                error: UserAddressError::MismatchedRecipient,
+            })
+        ));
+    }
+
+    /// A transparent `user_address` whose receiver script matches `script_pubkey`
+    /// satisfies the field's contract, and signing proceeds.
+    #[test]
+    fn signer_accepts_matching_transparent_user_address() {
+        let output = transparent_output(
+            TransparentAddress::PublicKeyHash([1; 20]),
+            ZcashAddress::from_transparent_p2pkh(NetworkType::Main, [1; 20]).encode(),
+        );
+
+        let mut pczt = Creator::new(BranchId::Nu6_3.into(), 100, 133, None, None)
+            .unwrap()
+            .build()
+            .unwrap();
+        pczt.transparent.outputs.push(output);
+
+        let _ = Signer::new(pczt).unwrap().finish();
+    }
+
+    /// A Sapling output's `user_address` is checked against the Sapling recipient, and a
+    /// failure is attributed to the Sapling pool.
+    #[test]
+    fn signer_rejects_mismatched_sapling_user_address() {
+        let output = crate::sapling::Output {
+            cv: [0; 32],
+            cmu: [1; 32],
+            ephemeral_key: [2; 32],
+            enc_ciphertext: alloc::vec![3; 580],
+            out_ciphertext: alloc::vec![4; 80],
+            zkproof: None,
+            recipient: Some([9; 43]),
+            value: None,
+            rseed: None,
+            rcv: None,
+            ock: None,
+            zip32_derivation: None,
+            user_address: Some(ZcashAddress::from_sapling(NetworkType::Main, [8; 43]).encode()),
+            proprietary: BTreeMap::new(),
+        };
+
+        let mut pczt = Creator::new(BranchId::Nu6_3.into(), 100, 133, None, None)
+            .unwrap()
+            .build()
+            .unwrap();
+        pczt.sapling.outputs.push(output);
+
+        assert!(matches!(
+            Signer::new(pczt),
+            Err(Error::UserAddress {
+                pool: PoolType::Shielded(ShieldedPool::Sapling),
+                index: 0,
+                error: UserAddressError::MismatchedRecipient,
+            })
+        ));
+    }
+
+    /// Builds a transparent output paying `addr`, with the given display string.
+    fn transparent_output(
+        addr: TransparentAddress,
+        user_address: String,
+    ) -> crate::transparent::Output {
+        crate::transparent::Output {
+            value: 100,
+            script_pubkey: addr.script().to_bytes(),
+            redeem_script: None,
+            bip32_derivation: BTreeMap::new(),
+            user_address: Some(user_address),
+            proprietary: BTreeMap::new(),
+        }
     }
 }
